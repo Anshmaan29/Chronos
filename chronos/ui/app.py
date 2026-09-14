@@ -24,9 +24,11 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (QApplication, QFileDialog, QFrame, QHBoxLayout,
-                             QLabel, QMainWindow, QPushButton, QSizePolicy,
+                             QGridLayout, QLabel, QMainWindow, QPushButton,
+                             QScrollArea,
+                             QSizePolicy,
                              QSlider, QVBoxLayout, QWidget)
 
 from chronos.degrade import KINDS, DegradeConfig, degrade
@@ -35,7 +37,7 @@ from chronos.temporal import WHEELS, WheelSample, WheelState
 from chronos.ui import theme as T
 from chronos.ui.timeline import render_wheel_timeline
 from chronos.ui.export import export as export_run
-from chronos.ui.widgets import (AnalysisReport, Bar, EvidenceStrip, HazardBar,
+from chronos.ui.widgets import (AnalysisReport, Bar, EvidenceStrip, F1Badge, HazardBar,
                                 ImagePane, IncidentLog, Readout, SubScores,
                                 VerdictBox, Wordmark, apply_block_shadow)
 
@@ -1064,7 +1066,51 @@ class Engine(QThread):
 # --------------------------------------------------------------------------
 
 
+class StatusLabel(QLabel):
+    """One-line status that elides to fit instead of widening the window.
+
+    A plain QLabel's minimum width is its full text, so a long
+    "ANALYSIS DONE ..." line pushed the window past the screen edge.  The
+    full text stays available as the tooltip.
+    """
+
+    def __init__(self, text: str = ""):
+        super().__init__()
+        self._full = ""
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.setText(text)
+
+    def setText(self, text) -> None:  # noqa: N802
+        self._full = "" if text is None else str(text)
+        self.setToolTip(self._full)
+        self._elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def _elide(self) -> None:
+        width = max(self.width(), 1)
+        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, width)
+        super().setText(shown)
+
+    def minimumSizeHint(self):  # noqa: N802
+        hint = super().minimumSizeHint()
+        hint.setWidth(0)
+        return hint
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        self._elide()
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        self._elide()       # the stylesheet font arrives after construction
+
+
 class Console(QMainWindow):
+    #: the video / image pane never gets shorter than this; below it the page scrolls
+    VIDEO_MIN_H = 340
+
     def __init__(self, source: FrameSource, kind: str = "rubber"):
         super().__init__()
         self._detector = source.detector
@@ -1085,24 +1131,56 @@ class Console(QMainWindow):
         self.alert_rule.setVisible(False)
         outer.addWidget(self.alert_rule)
 
+        # The whole console scrolls vertically when the window is shorter than
+        # the layout.  That lets the video pane be a useful size on a laptop
+        # instead of everything being squeezed, and it can never push the
+        # window past the screen edge again.
         body = QWidget()
-        outer.addWidget(body, 1)
-        grid = QVBoxLayout(body)
+        body.setObjectName("consoleBody")
+        self.page_scroll = QScrollArea()
+        self.page_scroll.setWidgetResizable(True)
+        self.page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.page_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.page_scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.page_scroll.setWidget(body)
+        outer.addWidget(self.page_scroll, 1)
+        # A grid, so the metrics column can change its row span.  On a tall
+        # screen it sits beside the video only (the original look).  On a short
+        # one (a laptop) it runs the full height of the window, which gives it
+        # enough room to show without scrolling.
+        grid = QGridLayout(body)
         grid.setContentsMargins(14, 12, 14, 12)
-        grid.setSpacing(10)
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(10)
+        grid.setColumnStretch(0, 6)
+        grid.setColumnStretch(1, 4)
+        self._grid = grid
 
-        grid.addWidget(self._header(source))
+        self.header = self._header(source)
+        grid.addWidget(self.header, 0, 0, 1, 2)
 
-        top = QHBoxLayout()
-        top.setSpacing(10)
         self.video = ImagePane("no signal")
-        top.addWidget(self.video, 6)
-        top.addWidget(self._metrics(), 4)
-        grid.addLayout(top, 5)
+        self.video.setMinimumSize(480, self.VIDEO_MIN_H)
+        grid.addWidget(self.video, 1, 0)
+        # Still inside a scroll area as the last resort: if even the tall
+        # column is too short (a very small window) it scrolls rather than
+        # pushing the window past the screen, which is what broke clicks in
+        # fullscreen.
+        self.metrics_scroll = QScrollArea()
+        self.metrics_scroll.setWidgetResizable(True)
+        self.metrics_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.metrics_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.metrics_scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.metrics_scroll.viewport().setAutoFillBackground(False)
+        self.metrics_panel = self._metrics()
+        self.metrics_scroll.setWidget(self.metrics_panel)
+        grid.addWidget(self.metrics_scroll, 1, 1)
 
-        strip = self._slider_strip()
-        apply_block_shadow(strip)
-        grid.addWidget(strip)
+        self.strip = self._slider_strip()
+        apply_block_shadow(self.strip)
 
         # The evidence strip sits directly under the control it is produced
         # by, and above the timeline, because it is the first thing anyone
@@ -1110,15 +1188,17 @@ class Console(QMainWindow):
         self.evidence = EvidenceStrip()
         self.evidence.jump.connect(self.on_jump)
         apply_block_shadow(self.evidence)
-        grid.addWidget(self.evidence)
 
         self.timeline = ImagePane("wheel-state timeline")
         self.timeline.setMinimumHeight(132)
         self.timeline.setMaximumHeight(172)
-        grid.addWidget(self.timeline)
 
         self.log = IncidentLog()
-        grid.addWidget(self.log, 1)
+
+        self._tall_metrics: Optional[bool] = None
+        self._set_tall_metrics(False)
+        grid.setRowStretch(1, 5)
+        grid.setRowStretch(5, 1)
 
         # full-window analysis, on R.  An overlay, never a second window: a
         # demo that has to find another window on a projector has already
@@ -1136,9 +1216,70 @@ class Console(QMainWindow):
         self.engine.failed.connect(self.on_failed)
         self.engine.done.connect(self.on_done)
         self.engine.status.connect(lambda s: self.status.setText(s))
+        self._body = body
+        self._sync_contamination(source)
         self.engine.start()
 
     # ------------------------------------------------------------------
+
+    def _set_tall_metrics(self, tall: bool) -> None:
+        """Place the metrics column beside the video only, or full height."""
+        if tall == self._tall_metrics:
+            return
+        self._tall_metrics = tall
+        grid = self._grid
+        movable = (self.metrics_scroll, self.strip, self.evidence,
+                   self.timeline, self.log)
+        for w in movable:
+            grid.removeWidget(w)
+        cols = 1 if tall else 2
+        grid.addWidget(self.metrics_scroll, 1, 1, 5 if tall else 1, 1)
+        grid.addWidget(self.strip, 2, 0, 1, cols)
+        grid.addWidget(self.evidence, 3, 0, 1, cols)
+        grid.addWidget(self.timeline, 4, 0, 1, cols)
+        grid.addWidget(self.log, 5, 0, 1, cols)
+
+    def _update_metrics_layout(self) -> None:
+        """Go full-height only when the side-by-side layout would need scrolling."""
+        try:
+            body = getattr(self, "_body", None)
+            if body is None or not self.isVisible():
+                return
+            m = self._grid.contentsMargins()
+            below = [self.strip, self.evidence, self.timeline, self.log]
+            shown = [w for w in below if not w.isHidden()]
+            top_row = max(self.metrics_panel.minimumSizeHint().height(),
+                          self.video.minimumSizeHint().height())
+            needed = (m.top() + m.bottom()
+                      + self.header.minimumSizeHint().height() + top_row
+                      + self._grid.verticalSpacing() * (len(shown) + 1)
+                      + sum(w.minimumSizeHint().height() for w in shown))
+            # the visible height of the page, not the (scrollable) body
+            available = self.page_scroll.viewport().height()
+            if self._tall_metrics:
+                # small margin so the layout does not flip back and forth
+                self._set_tall_metrics(available < needed + 16)
+            else:
+                self._set_tall_metrics(available < needed)
+        except Exception as exc:     # layout is cosmetic; never take the app down
+            print(f"layout: {type(exc).__name__}: {exc}", file=sys.stderr)
+
+    def _sync_contamination(self, source: FrameSource) -> None:
+        """The contamination slider only acts on the synthetic demo scene.
+
+        On uploaded footage (frame-by-frame analysis) it does nothing, so it is
+        hidden there rather than left as a control that silently does nothing.
+        """
+        synthetic = getattr(source, "kind", "") == "synthetic"
+        for w in (self.contam_cap, self.slider, self.level_label):
+            w.setVisible(synthetic)
+        self.strip_spacer.setVisible(not synthetic)
+        if not synthetic and self.slider.value() != 0:
+            self.slider.setValue(0)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        QTimer.singleShot(0, self._update_metrics_layout)
 
     def _header(self, source: FrameSource) -> QWidget:
         w = QWidget()
@@ -1148,14 +1289,19 @@ class Console(QMainWindow):
         title = Wordmark("CHRONOS", 30 if t.name == "f1" else 24)
         sub = QLabel("REFERENCE INTEGRITY")
         sub.setObjectName("caption")
-        self.status = QLabel(source.label)
+        self.status = StatusLabel(source.label)
         self.status.setObjectName("caption")
         self.status.setAlignment(Qt.AlignmentFlag.AlignRight)
+        if t.name == "f1":
+            h.addWidget(F1Badge(30))
+            h.addSpacing(8)
         h.addWidget(title)
         h.addSpacing(10)
         h.addWidget(sub)
-        h.addStretch(1)
-        h.addWidget(self.status)
+        h.addSpacing(24)
+        # takes the remaining width itself (right-aligned); a separate stretch
+        # would starve an Ignored-policy label down to zero width
+        h.addWidget(self.status, 1)
         return w
 
     def _metrics(self) -> QWidget:
@@ -1215,10 +1361,19 @@ class Console(QMainWindow):
         # size, so a single fixed width clips the word in one theme
         cap.setFixedWidth(170 if T.active().name == "brutal" else 140)
         h.addWidget(cap)
+        self.contam_cap = cap
+
+        # stands in for the slider when it is hidden, so the buttons stay right
+        self.strip_spacer = QWidget()
+        self.strip_spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                        QSizePolicy.Policy.Fixed)
+        self.strip_spacer.setVisible(False)
+        h.addWidget(self.strip_spacer, 1)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 100)
         self.slider.setValue(0)
+        self.slider.setMinimumWidth(160)
         self.slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.slider.valueChanged.connect(self.on_level)
         h.addWidget(self.slider, 1)
@@ -1336,6 +1491,7 @@ class Console(QMainWindow):
         self.session.setText("--")
         self.slider.setEnabled(True)
         self.slider.setToolTip("")
+        self._sync_contamination(source)
         self.verdict.set_verdict(None, "waiting for the first excursion", T.DIM)
         self.status.setText(f"{source.label}  ·  detector {self._detector}")
         self.engine = Engine(source, self.engine.kind)
@@ -1813,6 +1969,8 @@ class Console(QMainWindow):
         super().resizeEvent(event)
         if self.report.isVisible():
             self.report.setGeometry(self.centralWidget().rect())
+        # after the layout has settled at the new size, not during it
+        QTimer.singleShot(0, self._update_metrics_layout)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         key = event.key()
@@ -1867,6 +2025,20 @@ class Console(QMainWindow):
         super().closeEvent(event)
 
 
+def fit_to_screen(win: QMainWindow, app: QApplication) -> None:
+    """Open at 1600x1040 or the usable screen area, whichever is smaller, centred."""
+    screen = app.primaryScreen()
+    if screen is None:
+        return
+    avail = screen.availableGeometry()
+    frame_extra = 32            # title bar, which availableGeometry excludes
+    w = min(1600, avail.width())
+    h = min(1040, avail.height() - frame_extra)
+    win.resize(w, h)
+    win.move(avail.x() + (avail.width() - w) // 2,
+             avail.y() + max(0, (avail.height() - frame_extra - h) // 2))
+
+
 def run(video: Optional[str] = None, path: str = "violation",
         kind: str = "rubber", frames: int = 70, detector: str = "auto",
         theme: str = "instrument") -> int:
@@ -1882,5 +2054,6 @@ def run(video: Optional[str] = None, path: str = "violation",
         print(f"cannot start: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 2
     win = Console(source, kind)
+    fit_to_screen(win, app)
     win.show()
     return app.exec()

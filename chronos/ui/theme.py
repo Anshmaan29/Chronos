@@ -370,7 +370,13 @@ QScrollBar::handle:vertical {{
     background: {t.accent if brut else t.edge};
     border-radius: {4 if f1 else 0}px;
 }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0px; }}
+QScrollBar:horizontal {{ background: {t.bg}; height: {10 if brut else 8}px; }}
+QScrollBar::handle:horizontal {{
+    background: {t.accent if brut else t.edge};
+    border-radius: {4 if f1 else 0}px;
+    min-width: 24px;
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{ height: 0px; width: 0px; }}
 QToolTip {{
     background: {t.ink};
     color: {t.bone};

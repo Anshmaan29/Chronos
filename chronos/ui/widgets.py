@@ -11,7 +11,7 @@ import os
 from typing import Optional, Sequence
 
 import numpy as np
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtCore import QPoint
 from PyQt6.QtGui import (QColor, QFont, QFontMetrics, QImage, QPainter,
                          QPixmap, QPolygon)
@@ -98,6 +98,16 @@ class ImagePane(QLabel):
             return
         self._pix = pix
         self._rescale()
+
+    # A QLabel reports its pixmap's size as its size hint.  Because the pixmap
+    # is scaled to the label, the label could only ever grow: going fullscreen
+    # locked the layout at fullscreen size, and the window then ran past the
+    # screen edge.  Hints come from the fixed minimum instead.
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -298,6 +308,51 @@ class VerdictBox(QFrame):
         self.reason.setText(reason or "")
 
 
+class F1Badge(QWidget):
+    """An "F1" mark beside the wordmark in the f1 theme.
+
+    Drop the official logo at ``assets/f1_logo.png`` and it is drawn as is
+    (kept out of the repo for the trade-mark reason given on Wordmark).
+    Without that file, a plain "F1" is set in heavy italic brand red --
+    typed text, not a copy of the protected roundel.
+    """
+
+    def __init__(self, height: int = 30):
+        super().__init__()
+        self._h = height
+        self.setFixedHeight(height)
+        self._logo: Optional[QPixmap] = None
+        path = os.path.join(T.ASSETS, "f1_logo.png")
+        if os.path.exists(path):
+            pix = QPixmap(path)
+            if not pix.isNull():
+                self._logo = pix.scaledToHeight(
+                    height, Qt.TransformationMode.SmoothTransformation)
+        if self._logo is not None:
+            self.setFixedWidth(self._logo.width())
+        else:
+            self.setFixedWidth(QFontMetrics(self._font()).horizontalAdvance("F1") + 10)
+        self.setToolTip("Formula 1 track limits")
+
+    def _font(self) -> QFont:
+        f = QFont(_family(T.SANS), int(self._h * 0.72))
+        f.setWeight(QFont.Weight.Black)
+        f.setItalic(True)
+        return f
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._logo is not None:
+            p.drawPixmap(0, (self.height() - self._logo.height()) // 2, self._logo)
+        else:
+            p.setFont(self._font())
+            p.setPen(QColor(T.active().mark or T.active().accent))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignVCenter
+                       | Qt.AlignmentFlag.AlignLeft, "F1")
+        p.end()
+
+
 class Wordmark(QWidget):
     """The console's brand mark, in the F1 visual language.
 
@@ -462,14 +517,46 @@ class EvidenceStrip(QFrame):
         self.head = QLabel("EVIDENCE  ·  FRAME AT PEAK MARGIN")
         self.head.setObjectName("caption")
         lay.addWidget(self.head)
-        self.row = QHBoxLayout()
+        # Cards sit in a sideways scroll area.  Laid out directly, eight
+        # 208 px cards made the strip ~1.7k px wide at minimum, which on a
+        # laptop pushed the right-hand metrics panel off the window at the end
+        # of a long video.
+        holder = QWidget()
+        holder.setObjectName("evidenceRow")
+        holder.setStyleSheet("QWidget#evidenceRow { background: transparent; }")
+        self.row = QHBoxLayout(holder)
+        self.row.setContentsMargins(0, 0, 0, 0)
         self.row.setSpacing(8)
-        lay.addLayout(self.row)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        self.scroll.viewport().setAutoFillBackground(False)
+        self.scroll.setWidget(holder)
+        lay.addWidget(self.scroll)
         self.empty = QLabel("no excursion captured yet")
         self.empty.setObjectName("label")
         self.row.addWidget(self.empty)
         self.row.addStretch(1)
         self._cards: list[EvidenceCard] = []
+        self._fit_height()
+
+    def _fit_height(self) -> None:
+        """Tall enough for the cards plus the sideways scrollbar, no taller."""
+        # measured from the cards themselves: the holder's own hint is cached
+        # until the next event-loop pass, so it still reads "empty" right
+        # after a card is added
+        inner = 20
+        for i in range(self.row.count()):
+            w = self.row.itemAt(i).widget()
+            if w is not None:
+                w.ensurePolished()
+                inner = max(inner, w.sizeHint().height(),
+                            w.minimumSizeHint().height(), w.minimumHeight())
+        bar = self.scroll.horizontalScrollBar().sizeHint().height()
+        self.scroll.setFixedHeight(inner + max(bar, 10) + 4)
 
     HEADS = {
         "excursion": "EVIDENCE  ·  FRAME AT PEAK MARGIN",
@@ -497,6 +584,7 @@ class EvidenceStrip(QFrame):
             self.empty = QLabel("no excursion captured yet")
             self.empty.setObjectName("label")
             self.row.insertWidget(0, self.empty)
+        self._fit_height()
 
     def add(self, image: np.ndarray, outcome: str, caption: str, color: str,
             frame_index: int = -1, has_reference: bool = True) -> None:
@@ -510,6 +598,8 @@ class EvidenceStrip(QFrame):
         self._cards.insert(0, card)
         while len(self._cards) > self.MAX:
             self._cards.pop().setParent(None)
+        self._fit_height()
+        self.scroll.horizontalScrollBar().setValue(0)   # newest is on the left
 
     def card_for(self, frame_index: int) -> Optional[EvidenceCard]:
         for c in self._cards:
